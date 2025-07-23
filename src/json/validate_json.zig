@@ -3,10 +3,12 @@ const std = @import("std");
 const debugPrint = std.debug.print;
 const stdout = std.io.getStdOut().writer();
 
-pub const JsonError = error{ UnmatchedClosingBrace, UnmatchedOpeningBrace, UnexpectedChar };
-pub const JsonErrorData = struct { offset: usize, character_at_offset: u8, expected_characters: [2]u8 };
+pub const JsonError = error{ CloseOrNewElementNotFound, KeyNotFound, AssignmentNotFound, ValueNotFound, InvalidValue, InvalidNumber, JsonStartNotFound, UnterminatedString };
+pub const JsonErrorData = struct { offset: usize, character_at_offset: u8 };
 
-const JsonElement = enum { Key, Value };
+const ReadingJsonElement = enum { key, value };
+
+const CharReaderState = enum { start, string_literal, string_literal_backslash, expect_key, expect_value, expect_assignment, expect_new_or_close };
 
 fn isWhitespace(c: u8) bool {
     if (c == ' ' or c == '\n' or c == '\r') {
@@ -29,71 +31,171 @@ pub fn validateJson(
     error_data: *?JsonErrorData,
 ) JsonError!bool {
     var brace_depth: u16 = 0;
-    var within_string: bool = false;
-    var expected_chars: [2]u8 = undefined;
-    expected_chars[0] = '{';
-    expected_chars[1] = '{';
-    var json_element: JsonElement = undefined;
+    var array_depth: u16 = 0;
+
+    var reading_json_element: ReadingJsonElement = .key;
 
     var i: usize = 0;
 
-    while (buf[i] != 0) : (i += 1) {
-        const char = buf[i];
-        if (isWhitespace(char)) {
-            continue;
-        }
-
-        // debugPrint("{c}", .{char});
-
-        if (within_string) {
-            if (char == '"') {
-                within_string = false;
-                if (json_element == .Key) {
-                    expected_chars[0] = ':';
-                    expected_chars[1] = ':';
-                    continue;
-                } else {
-                    expected_chars[0] = ',';
-                    expected_chars[1] = '}';
-                    continue;
-                }
+    read: switch (CharReaderState.start) {
+        .start => {
+            switch (buf[i]) {
+                ' ', '\n', '\r', '\t' => {
+                    i += 1;
+                    continue :read .start;
+                },
+                '{' => {
+                    brace_depth += 1;
+                    continue :read .expect_key;
+                },
+                else => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.UnexpectedJsonStart;
+                },
             }
-        } else if (!isExpectedChar(char, expected_chars)) {
-            error_data.* = JsonErrorData{ .offset = i, .character_at_offset = char, .expected_characters = expected_chars };
-            // debugPrint("expected characters {c} or {c}; got {c}\n", .{ expected_chars[0], expected_chars[1], char });
-            return JsonError.UnexpectedChar;
-        } else if (char == '"') {
-            within_string = true;
-            continue;
-        } else if (char == '{') {
-            json_element = .Key;
-            brace_depth += 1;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '\"';
-        } else if (char == '}') {
-            if (brace_depth == 0) {
-                error_data.* = JsonErrorData{ .offset = i, .character_at_offset = char, .expected_characters = expected_chars };
-                return JsonError.UnmatchedClosingBrace;
+        },
+        .expect_key => {
+            i += 1;
+            switch (buf[i]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_key;
+                },
+                '\"' => {
+                    continue :read .string_literal;
+                },
+                else => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.ExpectedKeyNotFound;
+                },
             }
-            brace_depth -= 1;
-            expected_chars[0] = ',';
-            expected_chars[1] = '}';
-        } else if (char == ':') {
-            json_element = .Value;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '{';
-        } else if (char == ',') {
-            json_element = .Key;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '\"';
-        }
+        },
+        .string_literal => {
+            i += 1;
+            switch (buf[i]) {
+                0, '\n' => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.UnterminatedString;
+                },
+                '\"' => {
+                    if (reading_json_element == .key) {
+                        continue :read .expect_assignment;
+                    }
+                },
+                else => continue :read .string_literal,
+            }
+        },
+        .string_literal_backslash => {
+            i += 1;
+            switch (buf[i]) {
+                0 => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.UnterminatedString;
+                },
+                else => {
+                    continue :read .string_literal;
+                },
+            }
+        },
+        .expect_assignment => {
+            i += 1;
+            switch (buf[i]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_assignment;
+                },
+                ':' => {
+                    reading_json_element = .value;
+                    continue :read .expect_value;
+                },
+                else => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.AssignmentNotFound;
+                },
+            }
+        },
+        .expect_value => {
+            i += 1;
+            switch (buf[i]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_value;
+                },
+                '\"' => {
+                    continue :read .string_literal;
+                },
+                '0'...'9' => {
+                    var decimal_point = false;
+                    i += 1;
+                    read_number_literal: switch (buf[i]) {
+                        '.' => {
+                            if (decimal_point) {
+                                error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                                return JsonError.InvalidNumber;
+                            }
+                            decimal_point = true;
+                            i += 1;
+                            continue :read_number_literal buf[i];
+                        },
+                        '0'...'9' => {
+                            i += 1;
+                            continue :read_number_literal buf[i];
+                        },
+                        else => continue :read .expect_new_or_close,
+                    }
+                },
+                'f' => {
+                    if (!std.mem.eql(buf[i..5], "false")) {
+                        error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                        return JsonError.InvalidValue;
+                    }
+                    i += 4; // move index to end of word (safe because we confirmed the word aboved)
+                    continue :read .expect_new_or_close;
+                },
+                't' => {
+                    if (!std.mem.eql(buf[i..5], "true")) {
+                        error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                        return JsonError.InvalidValue;
+                    }
+                    i += 3; // move index to end of word (safe because we confirmed the word aboved)
+                    continue :read .expect_new_or_close;
+                },
+                'n' => {
+                    if (!std.mem.eql(buf[i..5], "null")) {
+                        error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                        return JsonError.ValueNotFound;
+                    }
+                    i += 3; // move index to end of word (safe because we confirmed the word aboved)
+                    continue :read .expect_new_or_close;
+                },
+                '[' => {
+                    array_depth += 1;
+                    continue :read .expect_value;
+                },
+            }
+        },
+        .expect_new_or_close => {
+            i += 1;
+            switch (buf[i]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_new_or_close;
+                },
+                ',' => {
+                    std.debug.assert(false); //TODO: implement this
+                    //remember array depth
+                },
+                ']' => {
+                    std.debug.assert(false); //TODO: implement this
+                    //remember array depth
+                },
+                '}' => {
+                    std.debug.assert(false); //TODO: implement this
+                    //remember array depth
+                },
+                else => {
+                    error_data.* = JsonErrorData{ .offset = i, .character_at_offset = buf[i] };
+                    return JsonError.CloseOrNewElementNotFound;
+                },
+            }
+        },
     }
-
-    if (brace_depth != 0) {
-        return JsonError.UnmatchedOpeningBrace;
-    }
-
-    return true;
 }
 
 pub fn outputJsonError(error_data: JsonErrorData) !void {
