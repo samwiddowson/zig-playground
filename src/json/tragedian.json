@@ -1,4 +1,22 @@
 {
     "mask": "white",
-    "body": "black"
+    "body": "black",
+    "pi": 3.14,
+    "spooky": true,
+    "false": false,
+    "moreInfo": {
+        "game": "Pathologic",
+        "someValues": [
+            "one",
+            2,
+            [
+                "t",
+                "h",
+                "r",
+                {
+                    "e": 2
+                }
+            ]
+        ]
+    }
 }

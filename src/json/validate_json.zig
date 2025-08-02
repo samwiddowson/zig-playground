@@ -13,7 +13,6 @@ pub const JsonError = error{
     UnterminatedString,
     CloseOrNewElementNotFound,
     UnmatchedSquareBracket,
-    UnmatchedBrace,
     EndNotFound,
 };
 
@@ -87,7 +86,7 @@ pub fn validateJson(
             }
         },
         .string_literal => {
-            // debugPrint(".string_literal\n", .{});
+            // debugPrint(".string_literal {c}\n", .{buf[i]});
             i += 1;
             switch (buf[i]) {
                 0, '\n' => {
@@ -150,9 +149,11 @@ pub fn validateJson(
                     continue :read .expect_value;
                 },
                 '\"' => {
+                    // debugPrint("reading string \n", .{});
                     continue :read .string_literal;
                 },
                 '0'...'9' => {
+                    // debugPrint("reading number {c}\n", .{buf[i]});
                     var decimal_point = false;
                     read_number_literal: switch (buf[i + 1]) {
                         '.' => {
@@ -171,11 +172,19 @@ pub fn validateJson(
                             i += 1;
                             continue :read_number_literal buf[i + 1];
                         },
-                        else => continue :read .expect_new_or_close,
+                        ',', ']', '}', '\n' => continue :read .expect_new_or_close,
+                        else => {
+                            error_data.* = JsonErrorData{
+                                .offset = i,
+                                .character_at_offset = buf[i],
+                            };
+                            return JsonError.InvalidNumber;
+                        },
                     }
                 },
                 'f' => {
-                    if (!std.mem.eql(u8, buf[i..5], "false")) {
+                    // debugPrint("reading false \n", .{});
+                    if (!std.mem.eql(u8, buf[i .. i + 5], "false")) {
                         error_data.* = JsonErrorData{
                             .offset = i,
                             .character_at_offset = buf[i],
@@ -186,7 +195,8 @@ pub fn validateJson(
                     continue :read .expect_new_or_close;
                 },
                 't' => {
-                    if (!std.mem.eql(u8, buf[i..5], "true")) {
+                    // debugPrint("reading true \n", .{});
+                    if (!std.mem.eql(u8, buf[i .. i + 4], "true")) {
                         error_data.* = JsonErrorData{
                             .offset = i,
                             .character_at_offset = buf[i],
@@ -197,12 +207,13 @@ pub fn validateJson(
                     continue :read .expect_new_or_close;
                 },
                 'n' => {
-                    if (!std.mem.eql(u8, buf[i..5], "null")) {
+                    // debugPrint("reading null \n", .{});
+                    if (!std.mem.eql(u8, buf[i .. i + 4], "null")) {
                         error_data.* = JsonErrorData{
                             .offset = i,
                             .character_at_offset = buf[i],
                         };
-                        return JsonError.ValueNotFound;
+                        return JsonError.InvalidValue;
                     }
                     i += 3; // move index to end of word (safe because we confirmed the word aboved)
                     continue :read .expect_new_or_close;
@@ -250,11 +261,12 @@ pub fn validateJson(
                 },
                 '}' => {
                     if (brace_depth == 0) {
+                        //suspect this can't be reached but still
                         error_data.* = JsonErrorData{
                             .offset = i,
                             .character_at_offset = buf[i],
                         };
-                        return JsonError.UnmatchedBrace;
+                        return JsonError.EndNotFound;
                     }
 
                     brace_depth -= 1;
@@ -274,7 +286,7 @@ pub fn validateJson(
             }
         },
         .expect_end => {
-            debugPrint(".expect_end\n", .{});
+            // debugPrint(".expect_end\n", .{});
             i += 1;
             switch (buf[i]) {
                 ' ', '\n', '\r', '\t' => {
@@ -312,7 +324,7 @@ test "validateJson returns true for valid json" {
     const valid_json = @embedFile("tragedian.json");
 
     validateJson(valid_json, &error_data) catch |err| {
-        debugPrint("Unexpected error validation JSON: {}", .{err});
+        debugPrint("Unexpected error: {}", .{err});
         assert(false);
     };
 
@@ -348,12 +360,112 @@ test "validateJson returns AssignmentNotFound when keys are not followed by `,`"
     try expect(error_data.?.character_at_offset == '"');
 }
 
-// TODO: errors to test:
-// KeyNotFound,
-// ValueNotFound,
-// InvalidValue,
-// InvalidNumber,
-// UnterminatedString,
-// UnmatchedSquareBracket,
-// UnmatchedBrace,
-// EndNotFound,
+test "validateJson returns KeyNotFound when a string literal is not found at start of a key-value pair" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",body\":\"black\"}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.KeyNotFound);
+    try expect(error_data.?.offset == 16);
+    try expect(error_data.?.character_at_offset == 'b');
+}
+
+test "validateJson returns InvalidValue when value `true` is misspelled" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"spooky\":ture}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.InvalidValue);
+    try expect(error_data.?.offset == 40);
+    try expect(error_data.?.character_at_offset == 't');
+}
+
+test "validateJson returns InvalidValue when value `false` is misspelled" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"spooky\":flase}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.InvalidValue);
+    try expect(error_data.?.offset == 40);
+    try expect(error_data.?.character_at_offset == 'f');
+}
+
+test "validateJson returns InvalidValue when value `null` is misspelled" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"spooky\":nul}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.InvalidValue);
+    try expect(error_data.?.offset == 40);
+    try expect(error_data.?.character_at_offset == 'n');
+}
+
+test "validateJson returns InvalidNumber when number contains multiple '.' characters" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":3..14}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.InvalidNumber);
+    try expect(error_data.?.offset == 37);
+    try expect(error_data.?.character_at_offset == '.');
+}
+
+test "validateJson returns InvalidNumber when number contains invalid characters" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":3a.14}";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.InvalidNumber);
+    try expect(error_data.?.offset == 36);
+    try expect(error_data.?.character_at_offset == '3');
+}
+
+test "validateJson returns ValueNotFound when unexpected character found instead of value" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":d";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.ValueNotFound);
+    try expect(error_data.?.offset == 36);
+    try expect(error_data.?.character_at_offset == 'd');
+}
+
+test "validateJson returns UnterminatedString when json body ends in mid string" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":\"three point one fo";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.UnterminatedString);
+    try expect(error_data.?.offset == 55);
+    try expect(error_data.?.character_at_offset == 0);
+}
+
+test "validateJson returns UnmatchedSquareBracket when attempting to close a non-existant array" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":3]";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.UnmatchedSquareBracket);
+    try expect(error_data.?.offset == 37);
+    try expect(error_data.?.character_at_offset == ']');
+}
+
+test "validateJson returns EndNotFound when additional non-whitespace characters exist beyond the final closing brace" {
+    var error_data: ?JsonErrorData = null;
+    const unexpected_char_json = "{\"mask\":\"white\",\"body\":\"black\",\"pi\":3} }";
+
+    const err = validateJson(unexpected_char_json, &error_data);
+
+    try expect(err == JsonError.EndNotFound);
+    try expect(error_data.?.offset == 39);
+    try expect(error_data.?.character_at_offset == '}');
+}
