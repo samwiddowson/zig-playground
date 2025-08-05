@@ -23,7 +23,6 @@ const ReadingJsonElement = enum { key, value };
 const CharReaderState = enum {
     start,
     string_literal,
-    string_literal_backslash,
     expect_key,
     expect_value,
     expect_assignment,
@@ -88,7 +87,7 @@ pub fn validateJson(
         .string_literal => {
             // debugPrint(".string_literal {c}\n", .{buf[i]});
             i += 1;
-            switch (buf[i]) {
+            read_string_literal: switch (buf[i]) {
                 0, '\n' => {
                     error_data.* = JsonErrorData{
                         .offset = i,
@@ -96,28 +95,26 @@ pub fn validateJson(
                     };
                     return JsonError.UnterminatedString;
                 },
+                '\\' => {
+                    if (buf[i + 1] == 0) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i],
+                        };
+                        return JsonError.UnterminatedString;
+                    }
+                    i += 2;
+                    continue :read_string_literal buf[i];
+                },
                 '\"' => {
                     if (reading_json_element == .key) {
                         continue :read .expect_assignment;
                     }
                     continue :read .expect_new_or_close;
                 },
-                else => continue :read .string_literal,
-            }
-        },
-        .string_literal_backslash => {
-            // debugPrint(".string_literal_bs\n", .{});
-            i += 1;
-            switch (buf[i]) {
-                0 => {
-                    error_data.* = JsonErrorData{
-                        .offset = i,
-                        .character_at_offset = buf[i],
-                    };
-                    return JsonError.UnterminatedString;
-                },
                 else => {
-                    continue :read .string_literal;
+                    i += 1;
+                    continue :read_string_literal buf[i];
                 },
             }
         },
