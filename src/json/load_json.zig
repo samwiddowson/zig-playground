@@ -1,39 +1,298 @@
 const std = @import("std");
-const jsonValidator = @import("validate_json.zig");
 
+const debugPrint = std.debug.print;
 const stdout = std.io.getStdOut().writer();
 
-pub const JsonLoadError = error{ UnmatchedClosingBrace, UnmatchedOpeningBrace, UnexpectedChar, UnterminatedString, LoadError };
-pub const JsonErrorData = struct { offset: usize, character_at_offset: u8, expected_characters: [2]u8 };
+pub const JsonError = error{
+    StartNotFound,
+    KeyNotFound,
+    AssignmentNotFound,
+    ValueNotFound,
+    InvalidValue,
+    InvalidNumber,
+    UnterminatedString,
+    CloseOrNewElementNotFound,
+    UnmatchedSquareBracket,
+    EndNotFound,
+    UnexpectedKey,
+};
+
+const ReadingJsonElement = enum { key, value };
+
+const CharReaderState = enum {
+    start,
+    string_literal,
+    expect_key,
+    expect_value,
+    expect_assignment,
+    expect_new_or_close,
+    expect_end,
+};
+
+pub const JsonErrorData = struct { offset: usize, character_at_offset: u8 };
 pub const LoadErrorData = struct { field_name: [*:0]u8, field_path: [*:0]u8 };
 
 const ErrorData = union { json_error_data: JsonErrorData, load_error_data: LoadErrorData };
 
-const JsonElement = enum { Key, Value };
+pub fn parse_json_object(
+    comptime T: type,
+    buf: [*:0]const u8,
+    error_data: *?ErrorData,
+    i: *usize,
+) JsonError!T {
+    var obj = T{};
+    var array_depth: u16 = 0;
+    var reading_json_element: ReadingJsonElement = .key;
+    var field_name: []const u8 = undefined;
 
-fn isWhitespace(c: u8) bool {
-    if (c == ' ' or c == '\n' or c == '\r') {
-        return true;
+    read: switch (CharReaderState.start) {
+        .start => {
+            // debugPrint(".start\n", .{});
+            switch (buf[i.*]) {
+                ' ', '\n', '\r', '\t' => {
+                    i.* += 1;
+                    continue :read .start;
+                },
+                '{' => {
+                    continue :read .expect_key;
+                },
+                else => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i.*],
+                    };
+                    return JsonError.StartNotFound;
+                },
+            }
+        },
+        .expect_key => {
+            // debugPrint(".expect_key\n", .{});
+            reading_json_element = .key;
+            i.* += 1;
+            switch (buf[i.*]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_key;
+                },
+                '\"' => {
+                    continue :read .string_literal;
+                },
+                else => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i.*],
+                    };
+                    return JsonError.KeyNotFound;
+                },
+            }
+        },
+        .string_literal => {
+            // debugPrint(".string_literal {c}\n", .{buf[i.*]});
+            i.* += 1;
+            const string_literal_start: usize = i;
+            read_string_literal: switch (buf[i.*]) {
+                0, '\n' => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i.*],
+                    };
+                    return JsonError.UnterminatedString;
+                },
+                '\\' => {
+                    i.* += 1;
+                    if (buf[i.*] == 0) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i.*],
+                        };
+                        return JsonError.UnterminatedString;
+                    }
+                    // debugPrint("{c}", .{buf[i.*]});
+                    i.* += 1;
+                    continue :read_string_literal buf[i.*];
+                },
+                '\"' => {
+                    // debugPrint("\n", .{});
+                    if (reading_json_element == .key) {
+                        field_name = buf[string_literal_start..i.*];
+                        if (!@hasField(obj, field_name)) {
+                            error_data.* = LoadErrorData{ .field_name = field_name };
+                            return JsonError.UnterminatedString;
+                        }
+                        continue :read .expect_assignment;
+                    }
+                    @field(obj, field_name) = buf[string_literal_start..i.*];
+                    continue :read .expect_new_or_close;
+                },
+                else => {
+                    // debugPrint("{c}", .{buf[i.*]});
+                    i.* += 1;
+                    continue :read_string_literal buf[i.*];
+                },
+            }
+        },
+        .expect_assignment => {
+            // debugPrint(".expect_assignment\n", .{});
+            i.* += 1;
+            switch (buf[i.*]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_assignment;
+                },
+                ':' => {
+                    continue :read .expect_value;
+                },
+                else => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i.*],
+                    };
+                    return JsonError.AssignmentNotFound;
+                },
+            }
+        },
+        .expect_value => {
+            // debugPrint(".expect_value\n", .{});
+            reading_json_element = .value;
+            i.* += 1;
+            switch (buf[i.*]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_value;
+                },
+                '\"' => {
+                    // debugPrint("reading string \n", .{});
+                    continue :read .string_literal;
+                },
+                '0'...'9' => {
+                    // debugPrint("reading number {c}\n", .{buf[i.*]});
+                    var decimal_point = false;
+                    const number_start: usize = i;
+                    const NumberType = @Type(@field(obj, field_name));
+                    read_number_literal: switch (buf[i.* + 1]) {
+                        '.' => {
+                            if (decimal_point) {
+                                error_data.* = JsonErrorData{
+                                    .offset = i,
+                                    .character_at_offset = buf[i],
+                                };
+                                return JsonError.InvalidNumber;
+                            }
+                            decimal_point = true;
+                            i.* += 1;
+                            continue :read_number_literal buf[i.* + 1];
+                        },
+                        '0'...'9' => {
+                            i.* += 1;
+                            continue :read_number_literal buf[i.* + 1];
+                        },
+                        ',', ']', '}', '\n' => {
+                            @field(obj, field_name) = try std.fmt.parseInt(NumberType, buf[number_start..i.*], 10);
+                            continue :read .expect_new_or_close;
+                        },
+                        else => {
+                            error_data.* = JsonErrorData{
+                                .offset = i,
+                                .character_at_offset = buf[i],
+                            };
+                            return JsonError.InvalidNumber;
+                        },
+                    }
+                },
+                'f' => {
+                    // debugPrint("reading false \n", .{});
+                    if (!std.mem.eql(u8, buf[i.* .. i.* + 5], "false")) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i],
+                        };
+                        return JsonError.InvalidValue;
+                    }
+                    i.* += 4; // move index to end of word (safe because we confirmed the word aboved)
+                    @field(obj, field_name) = false;
+                    continue :read .expect_new_or_close;
+                },
+                't' => {
+                    // debugPrint("reading true \n", .{});
+                    if (!std.mem.eql(u8, buf[i.* .. i.* + 4], "true")) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i],
+                        };
+                        return JsonError.InvalidValue;
+                    }
+                    @field(obj, field_name) = true;
+                    i.* += 3; // move index to end of word (safe because we confirmed the word aboved)
+                    continue :read .expect_new_or_close;
+                },
+                'n' => {
+                    // debugPrint("reading null \n", .{});
+                    if (!std.mem.eql(u8, buf[i.* .. i.* + 4], "null")) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i],
+                        };
+                        return JsonError.InvalidValue;
+                    }
+                    @field(obj, field_name) = null;
+                    i += 3; // move index to end of word (safe because we confirmed the word aboved)
+                    continue :read .expect_new_or_close;
+                },
+                '[' => {
+                    std.debug.print("Array parsing is not yet implemented!", .{});
+                    std.debug.assert(false);
+                    array_depth += 1;
+                    continue :read .expect_value;
+                },
+                '{' => {
+                    @field(obj, field_name) = parse_json_object(@Type(@field(obj, field_name)), buf, error_data, &i);
+                    continue :read .expect_key;
+                },
+                else => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i],
+                    };
+                    return JsonError.ValueNotFound;
+                },
+            }
+        },
+        .expect_new_or_close => {
+            // debugPrint(".expect_new_etc\n", .{});
+            i += 1;
+            switch (buf[i.*]) {
+                ' ', '\n', '\r', '\t' => {
+                    continue :read .expect_new_or_close;
+                },
+                ',' => {
+                    if (array_depth > 0) {
+                        continue :read .expect_value;
+                    }
+                    continue :read .expect_key;
+                },
+                ']' => {
+                    if (array_depth == 0) {
+                        error_data.* = JsonErrorData{
+                            .offset = i,
+                            .character_at_offset = buf[i.*],
+                        };
+                        return JsonError.UnmatchedSquareBracket;
+                    }
+                    array_depth -= 1;
+                    continue :read .expect_new_or_close;
+                },
+                '}' => {
+                    return obj;
+                },
+                else => {
+                    error_data.* = JsonErrorData{
+                        .offset = i,
+                        .character_at_offset = buf[i.*],
+                    };
+                    return JsonError.CloseOrNewElementNotFound;
+                },
+            }
+        },
     }
-    return false;
-}
-
-fn isExpectedChar(char: u8, expected: [2]u8) bool {
-    if (expected[0] == char or expected[1] == char) {
-        return true;
-    }
-    return false;
-}
-
-fn getStringVal(buf: [*:0]u8, str: []u8, i: *usize) JsonLoadError!void {
-    const opening_offset = i.*;
-    i.* += 1;
-    while(buf[i.*] != '"'): (i.* += 1) {
-        if(buf[i.*] == 0 or buf[i.*] == '\n') {
-            return JsonLoadError.UnterminatedString;
-        }
-    }
-    str = buf[opening_offset..i.*];
+    debugPrint("Ooooops! Dropped out at index {d}\n", .{i});
+    unreachable;
 }
 
 pub fn load_json_object(
@@ -41,74 +300,26 @@ pub fn load_json_object(
     buf: [*:0]const u8,
     error_data: *?ErrorData,
 ) !T {
-    var loaded_obj: T = T{};
-    // each json key:
-    // - check @hasField(T, "keyname");
-    // - throw err if not
-    // - put value into T.keyname with @field(T, "keyname") = val
-    //
-    var brace_depth: u16 = 0;
-    var expected_chars: [2]u8 = undefined;
-    expected_chars[0] = '{';
-    expected_chars[1] = '{';
-    var json_element: JsonElement = undefined;
-
     var i: usize = 0;
-
+    const obj = parse_json_object(T, buf, error_data, &i);
     while (buf[i] != 0) : (i += 1) {
-        const char = buf[i];
-        if (isWhitespace(char)) {
-            continue;
-        }
-
-        // debugPrint("{c}", .{char});
-
-        if (!isExpectedChar(char, expected_chars)) {
-            error_data.* = JsonErrorData{ .offset = i, .character_at_offset = char, .expected_characters = expected_chars };
-            // debugPrint("expected characters {c} or {c}; got {c}\n", .{ expected_chars[0], expected_chars[1], char });
-            return JsonLoadError.UnexpectedChar;
-        } else if (char == '"') {
-            if(json_element == .Key) {
-                var key: []u8 = undefined;
-                getStringVal(buf, &i, &key) catch |err| {
-                    error_data.* = JsonErrorData {
-                        .offset = i,
-                        .character_at_offset = buf[i]
-                    };
-            };
-                if(!@hasField(T, key)){
-                    return JsonLoadError.LoadError;
-                }
-            }
-        }
-            continue;
-        } else if (char == '{') {
-            json_element = .Key;
-            brace_depth += 1;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '\"';
-        } else if (char == '}') {
-            if (brace_depth == 0) {
-                error_data.* = JsonErrorData{ .offset = i, .character_at_offset = char, .expected_characters = expected_chars };
-                return JsonError.UnmatchedClosingBrace;
-            }
-            brace_depth -= 1;
-            expected_chars[0] = ',';
-            expected_chars[1] = '}';
-        } else if (char == ':') {
-            json_element = .Value;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '{';
-        } else if (char == ',') {
-            json_element = .Key;
-            expected_chars[0] = '\"';
-            expected_chars[1] = '\"';
+        // debugPrint("check end\n", .{});
+        switch (buf[i]) {
+            ' ', '\n', '\r', '\t' => {
+                continue;
+            },
+            0 => {
+                // return without error: we found the end where we expected it to be!
+                return obj;
+            },
+            else => {
+                error_data.* = JsonErrorData{
+                    .offset = i,
+                    .character_at_offset = buf[i],
+                };
+                return JsonError.EndNotFound;
+            },
         }
     }
-
-    if (brace_depth != 0) {
-        return JsonError.UnmatchedOpeningBrace;
-    }
-
-    return true;
+    unreachable;
 }

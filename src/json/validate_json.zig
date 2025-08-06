@@ -96,23 +96,27 @@ pub fn validateJson(
                     return JsonError.UnterminatedString;
                 },
                 '\\' => {
-                    if (buf[i + 1] == 0) {
+                    i += 1;
+                    if (buf[i] == 0) {
                         error_data.* = JsonErrorData{
                             .offset = i,
                             .character_at_offset = buf[i],
                         };
                         return JsonError.UnterminatedString;
                     }
-                    i += 2;
+                    // debugPrint("{c}", .{buf[i]});
+                    i += 1;
                     continue :read_string_literal buf[i];
                 },
                 '\"' => {
+                    // debugPrint("\n", .{});
                     if (reading_json_element == .key) {
                         continue :read .expect_assignment;
                     }
                     continue :read .expect_new_or_close;
                 },
                 else => {
+                    // debugPrint("{c}", .{buf[i]});
                     i += 1;
                     continue :read_string_literal buf[i];
                 },
